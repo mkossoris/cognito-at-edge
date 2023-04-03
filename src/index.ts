@@ -376,6 +376,7 @@ export class Authenticator {
     event: CloudFrontRequestEvent,
     options?: HandleRefreshAuthOptions
   ) {
+    // TODO: Implement token refresh functionality
     return;
   }
 
@@ -390,6 +391,7 @@ export class Authenticator {
     event: CloudFrontRequestEvent,
     options?: HandleSignOutOptions
   ) {
+    // TODO: Implement sign out functionality
     return;
   }
 
