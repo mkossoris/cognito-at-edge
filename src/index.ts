@@ -33,11 +33,16 @@ interface HandleCheckAuthOptions {
 }
 
 interface HandleRefreshAuthOptions {
-  test: string;
+  refreshRedirectPath?: string;
 }
 
 interface HandleSignOutOptions {
-  test: string;
+  /**
+   * The path Cognito should redirect back to in your CloudFront distribution.
+   * Must start with "/".
+   * @default /
+   */
+  signOutRedirectPath?: string;
 }
 
 export class Authenticator {
@@ -51,6 +56,7 @@ export class Authenticator {
   _httpOnly: boolean;
   _sameSite?: SameSite;
   _cookieBase: string;
+  _userPoolTokenEndpoint: string;
   _logger;
   _jwtVerifier;
 
@@ -67,6 +73,7 @@ export class Authenticator {
     this._httpOnly = 'httpOnly' in params && params.httpOnly === true;
     this._sameSite = params.sameSite;
     this._cookieBase = `CognitoIdentityServiceProvider.${params.userPoolAppId}`;
+    this._userPoolTokenEndpoint = `https://${this._userPoolDomain}/oauth2/token`;
     this._logger = pino({
       level: params.logLevel || 'silent', // Default to silent
       base: null, //Remove pid, hostname and name logging as not usefull for Lambda
@@ -127,7 +134,7 @@ export class Authenticator {
         'base64'
       );
     const request = {
-      url: `https://${this._userPoolDomain}/oauth2/token`,
+      url: this._userPoolTokenEndpoint,
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
@@ -156,6 +163,64 @@ export class Authenticator {
           msg: 'Unable to fetch tokens from grant code',
           request,
           code,
+        });
+        throw err;
+      });
+  }
+
+  /**
+   * Exchange a refresh token for tokens.
+   * @param  {String} grantType        grantType
+   * @param  {String} refreshToken     refreshToken
+   * @param  {String} redirectUrl      redirectUrl
+   * @return {Promise} Authenticated user tokens.
+   */
+  private _exchangeRefreshTokenForTokens(
+    grantType: string,
+    refreshToken: string,
+    redirectUrl: string
+  ) {
+    const authorization =
+      this._userPoolAppSecret &&
+      Buffer.from(`${this._userPoolAppId}:${this._userPoolAppSecret}`).toString(
+        'base64'
+      );
+    this._logger.debug({
+      msg: 'Authorization token is: ',
+      authorization,
+    });
+    const request = {
+      url: this._userPoolTokenEndpoint,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        ...(authorization && { Authorization: `Basic ${authorization}` }),
+      },
+      data: stringify({
+        client_id: this._userPoolAppId,
+        // The token endpoint returns refresh_token only when the grant_type is authorization_code.
+        grant_type:
+          grantType === 'refresh_token'
+            ? 'refresh_token'
+            : 'authorization_code',
+        refresh_token: refreshToken,
+        redirect_uri: redirectUrl,
+      }),
+    } as const;
+    this._logger.debug({
+      msg: 'Fetching new tokens using refresh token...',
+      request,
+    });
+    return axios
+      .request(request)
+      .then((resp) => {
+        this._logger.debug({ msg: 'Fetched new tokens', tokens: resp.data });
+        return resp.data;
+      })
+      .catch((err) => {
+        this._logger.error({
+          msg: 'Unable to fetch new tokens using refresh tokens',
+          request,
         });
         throw err;
       });
@@ -240,7 +305,7 @@ export class Authenticator {
   /**
    * Extract value of the authentication token from the request cookies.
    * @param  {Array}  cookieHeaders 'Cookie' request headers.
-   * @return {String} Extracted access token. Throw if not found.
+   * @return {String} Extracted id token. Throw if not found.
    */
   private _getIdTokenFromCookie(
     cookieHeaders:
@@ -276,6 +341,45 @@ export class Authenticator {
     return token;
   }
 
+  /**
+   * Extract value of the refresh token from the request cookies.
+   * @param  {Array}  cookieHeaders 'Cookie' request headers.
+   * @return {String} Extracted refresh token. Throw if not found.
+   */
+  private _getRefreshTokenFromCookie(
+    cookieHeaders:
+      | Array<{ key?: string | undefined; value: string }>
+      | undefined
+  ) {
+    if (!cookieHeaders) {
+      this._logger.debug("Cookies weren't present in the request");
+      throw new Error("Cookies weren't present in the request");
+    }
+
+    this._logger.debug({
+      msg: 'Extracting authentication token from request cookie',
+      cookieHeaders,
+    });
+
+    const tokenCookieNamePrefix = `${this._cookieBase}.`;
+    const tokenCookieNamePostfix = '.refreshToken';
+
+    const cookies = cookieHeaders.flatMap((h) => Cookies.parse(h.value));
+    const token = cookies.find(
+      (c) =>
+        c.name.startsWith(tokenCookieNamePrefix) &&
+        c.name.endsWith(tokenCookieNamePostfix)
+    )?.value;
+
+    if (!token) {
+      this._logger.debug("refreshToken wasn't present in request cookies");
+      throw new Error("refreshToken isn't present in the request cookies");
+    }
+
+    this._logger.debug({ msg: 'Found refreshToken in cookie', token });
+    return token;
+  }
+
   private _validateHandleCheckAuthOptions(options?: HandleCheckAuthOptions) {
     if (!options) {
       return;
@@ -287,6 +391,21 @@ export class Authenticator {
     ) {
       throw new Error(
         'HandleCheckAuthOptions.signInRedirectPath must start with a "/"'
+      );
+    }
+  }
+
+  private _validateHandleSignOutOptions(options?: HandleSignOutOptions) {
+    if (!options) {
+      return;
+    }
+
+    if (
+      options.signOutRedirectPath &&
+      !options.signOutRedirectPath.startsWith('/')
+    ) {
+      throw new Error(
+        'HandleSignOutOptions.signOutRedirectPath must start with a "/"'
       );
     }
   }
@@ -376,8 +495,65 @@ export class Authenticator {
     event: CloudFrontRequestEvent,
     options?: HandleRefreshAuthOptions
   ) {
-    // TODO: Implement token refresh functionality
-    return;
+    this._logger.debug({ msg: 'Handling Lambda@Edge event', event });
+
+    const { request } = event.Records[0].cf;
+    const requestParams = parse(request.querystring);
+    this._logger.debug({ msg: 'request params', requestParams });
+    const cfDomain = request.headers.host[0].value;
+    let redirectURI = `https://${cfDomain}`;
+
+    if (options?.refreshRedirectPath) {
+      redirectURI += options.refreshRedirectPath;
+    }
+
+    try {
+      const refreshToken = this._getRefreshTokenFromCookie(
+        request.headers.cookie
+      );
+      this._logger.debug({
+        msg: 'Fetching new tokens using refresh token...',
+        refreshToken,
+      });
+
+      const newTokens = await this._exchangeRefreshTokenForTokens(
+        'refresh_token',
+        refreshToken,
+        redirectURI
+      );
+      newTokens.refresh_token = refreshToken;
+      return this._getRedirectResponse(newTokens, cfDomain, redirectURI);
+    } catch (err) {
+      this._logger.debug("User isn't authenticated: %s", err);
+      const userPoolUrl = `https://${this._userPoolDomain}?error=unauthorized_client`;
+      this._logger.debug(
+        'Throw 401 - if the user never authenticated or refresh_token is revoked or expired'
+      );
+      return {
+        status: '401',
+        statusDescription: 'Unauthorized',
+        headers: {
+          location: [
+            {
+              key: 'Location',
+              value: userPoolUrl,
+            },
+          ],
+          'cache-control': [
+            {
+              key: 'Cache-Control',
+              value: 'no-cache, no-store, max-age=0, must-revalidate',
+            },
+          ],
+          pragma: [
+            {
+              key: 'Pragma',
+              value: 'no-cache',
+            },
+          ],
+        },
+      };
+    }
   }
 
   /**
