@@ -57,6 +57,8 @@ export class Authenticator {
   _sameSite?: SameSite;
   _cookieBase: string;
   _userPoolTokenEndpoint: string;
+  _userPoolRevokeEndpoint: string;
+  _userPoolLogOutEndpoint: string;
   _logger;
   _jwtVerifier;
 
@@ -74,6 +76,8 @@ export class Authenticator {
     this._sameSite = params.sameSite;
     this._cookieBase = `CognitoIdentityServiceProvider.${params.userPoolAppId}`;
     this._userPoolTokenEndpoint = `https://${this._userPoolDomain}/oauth2/token`;
+    this._userPoolRevokeEndpoint = `https://${this._userPoolDomain}/oauth2/revoke`;
+    this._userPoolLogOutEndpoint = `https://${this._userPoolDomain}/logout`;
     this._logger = pino({
       level: params.logLevel || 'silent', // Default to silent
       base: null, //Remove pid, hostname and name logging as not usefull for Lambda
@@ -227,6 +231,77 @@ export class Authenticator {
   }
 
   /**
+   * Revoke tokens using refresh token from current session. Pass the refresh token that the client wants to revoke in the request body.
+   * The request also revokes all access tokens that Amazon Cognito issued with this refresh token.
+   * @param  {String} refreshToken     refreshToken
+   * @return {Promise} void
+   */
+  private _revokeTokensUsingRefreshToken(refreshToken: string) {
+    const authorization =
+      this._userPoolAppSecret &&
+      Buffer.from(`${this._userPoolAppId}:${this._userPoolAppSecret}`).toString(
+        'base64'
+      );
+    this._logger.debug({
+      msg: 'Authorization token is: ',
+      authorization,
+    });
+    const request = {
+      url: this._userPoolRevokeEndpoint,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        ...(authorization && { Authorization: `Basic ${authorization}` }),
+      },
+      data: stringify({
+        client_id: this._userPoolAppId,
+        token: refreshToken,
+      }),
+    } as const;
+    this._logger.debug({
+      msg: 'Revoking tokens using refresh token...',
+      request,
+    });
+    return axios
+      .request(request)
+      .then((resp) => {
+        this._logger.debug({ msg: 'Revoked new tokens', resp: resp.data });
+      })
+      .catch((err) => {
+        this._logger.error({
+          msg: 'Unable to revoke tokens using refresh tokens',
+          request,
+        });
+        throw err;
+      });
+  }
+
+  /**
+   * Signs the user out and redirects to an authorized sign-out URL for app client.
+   * @param  {String} logoutUrl       logoutUrl
+   * @return {Promise} void
+   */
+  private _logoutFromUserPool(logoutUrl: string) {
+    const getUrl = `${this._userPoolLogOutEndpoint}?client_id=${this._userPoolAppId}&logout_uri=${logoutUrl}`;
+    this._logger.debug({
+      msg: 'Signing out current session...',
+      getUrl,
+    });
+    return axios
+      .get(getUrl)
+      .then(() => {
+        this._logger.debug({ msg: 'Successfully signed out current session' });
+      })
+      .catch((err) => {
+        this._logger.error({
+          msg: 'Unable to sign out',
+          getUrl,
+        });
+        throw err;
+      });
+  }
+
+  /**
    * Create a Lambda@Edge redirection response to set the tokens on the user's browser cookies.
    * @param  {Object} tokens   Cognito User Pool tokens.
    * @param  {String} domain   Website domain.
@@ -279,6 +354,156 @@ export class Authenticator {
           {
             key: 'Location',
             value: location,
+          },
+        ],
+        'cache-control': [
+          {
+            key: 'Cache-Control',
+            value: 'no-cache, no-store, max-age=0, must-revalidate',
+          },
+        ],
+        pragma: [
+          {
+            key: 'Pragma',
+            value: 'no-cache',
+          },
+        ],
+        'set-cookie': cookies.map((c) => ({ key: 'Set-Cookie', value: c })),
+      },
+    };
+
+    this._logger.debug({ msg: 'Generated set-cookie response', response });
+
+    return response;
+  }
+
+  /**
+   * Create a Lambda@Edge redirection response to clean up user's browser cookies.
+   * @param  {Object} tokens   Cognito User Pool tokens.
+   * @param  {String} domain   Website domain.
+   * @param  {String} redirectURI Path to redirection.
+   * @return {Object} Lambda@Edge response.
+   */
+  private async _cleanUpCookieUsingToken(tokens, domain, redirectURI) {
+    const decoded = await this._jwtVerifier.verify(tokens.id_token);
+    const username = decoded['cognito:username'];
+    const usernameBase = `${this._cookieBase}.${username}`;
+    const cookieAttributes: CookieAttributes = {
+      domain: this._disableCookieDomain ? undefined : domain,
+      expires: new Date(0),
+      secure: true,
+      httpOnly: this._httpOnly,
+      sameSite: this._sameSite,
+    };
+    const cookies = [
+      Cookies.serialize(`${usernameBase}.accessToken`, '', cookieAttributes),
+      Cookies.serialize(`${usernameBase}.idToken`, '', cookieAttributes),
+      Cookies.serialize(`${usernameBase}.refreshToken`, '', cookieAttributes),
+      Cookies.serialize(
+        `${usernameBase}.tokenScopesString`,
+        '',
+        cookieAttributes
+      ),
+      Cookies.serialize(
+        `${this._cookieBase}.LastAuthUser`,
+        '',
+        cookieAttributes
+      ),
+    ];
+
+    const response = {
+      status: '302',
+      headers: {
+        location: [
+          {
+            key: 'Location',
+            value: `${this._userPoolLogOutEndpoint}?client_id=${this._userPoolAppId}&logout_uri=${redirectURI}`,
+          },
+        ],
+        'cache-control': [
+          {
+            key: 'Cache-Control',
+            value: 'no-cache, no-store, max-age=0, must-revalidate',
+          },
+        ],
+        pragma: [
+          {
+            key: 'Pragma',
+            value: 'no-cache',
+          },
+        ],
+        'set-cookie': cookies.map((c) => ({ key: 'Set-Cookie', value: c })),
+      },
+    };
+
+    this._logger.debug({ msg: 'Generated set-cookie response', response });
+
+    return response;
+  }
+
+  /**
+   * Extract value of the authentication token from the request cookies.
+   * @param  {Array}  cookieHeaders 'Cookie' request headers.
+   * @return {String} Extracted id token. Throw if not found.
+   */
+  private _cleanUpCookieUsingCookie(
+    domain,
+    redirectURI,
+    cookieHeaders:
+      | Array<{ key?: string | undefined; value: string }>
+      | undefined
+  ) {
+    if (!cookieHeaders) {
+      this._logger.debug("Cookies weren't present in the request");
+      throw new Error("Cookies weren't present in the request");
+    }
+
+    this._logger.debug({
+      msg: 'Extracting authentication token from request cookie',
+      cookieHeaders,
+    });
+
+    const tokenCookieNamePrefix = `${this._cookieBase}.`;
+    const tokenCookieNamePostfix = '.idToken';
+    const usernameBase = cookieHeaders
+      .flatMap((h) => Cookies.parse(h.value))
+      .find(
+        (c) =>
+          c.name.startsWith(tokenCookieNamePrefix) &&
+          c.name.endsWith(tokenCookieNamePostfix)
+      )
+      ?.name.replace('.idToken', '');
+
+    const cookieAttributes: CookieAttributes = {
+      domain: this._disableCookieDomain ? undefined : domain,
+      expires: new Date(0),
+      secure: true,
+      httpOnly: this._httpOnly,
+      sameSite: this._sameSite,
+    };
+    const cookies = [
+      Cookies.serialize(`${usernameBase}.accessToken`, '', cookieAttributes),
+      Cookies.serialize(`${usernameBase}.idToken`, '', cookieAttributes),
+      Cookies.serialize(`${usernameBase}.refreshToken`, '', cookieAttributes),
+      Cookies.serialize(
+        `${usernameBase}.tokenScopesString`,
+        '',
+        cookieAttributes
+      ),
+      Cookies.serialize(
+        `${this._cookieBase}.LastAuthUser`,
+        '',
+        cookieAttributes
+      ),
+    ];
+
+    const response = {
+      status: '302',
+      headers: {
+        location: [
+          {
+            key: 'Location',
+            value: `${this._userPoolLogOutEndpoint}?client_id=${this._userPoolAppId}&logout_uri=${redirectURI}`,
           },
         ],
         'cache-control': [
@@ -453,7 +678,7 @@ export class Authenticator {
         if (request.querystring && request.querystring !== '') {
           redirectPath += encodeURIComponent('?' + request.querystring);
         }
-        const userPoolUrl = `https://${this._userPoolDomain}/authorize?redirect_uri=${redirectURI}&response_type=code&client_id=${this._userPoolAppId}&state=${redirectPath}`;
+        const userPoolUrl = `https://${this._userPoolDomain}/login?redirect_uri=${redirectURI}&response_type=code&client_id=${this._userPoolAppId}&state=${redirectPath}`;
         this._logger.debug(
           `Redirecting user to Cognito User Pool URL ${userPoolUrl}`
         );
@@ -495,7 +720,10 @@ export class Authenticator {
     event: CloudFrontRequestEvent,
     options?: HandleRefreshAuthOptions
   ) {
-    this._logger.debug({ msg: 'Handling Lambda@Edge event', event });
+    this._logger.debug({
+      msg: 'Handling refresh token logic from Lambda@Edge event',
+      event,
+    });
 
     const { request } = event.Records[0].cf;
     const requestParams = parse(request.querystring);
@@ -557,7 +785,7 @@ export class Authenticator {
   }
 
   /**
-   * Signs the user our of their current session. Removes both access token and refresh token
+   * Signs the user out of their current session. Removes both access token and refresh token
    * from cookies and invalidates the refresh token with Cognito.
    * @param event The CloudFront event.
    * @param options Options to configure the sign out behavior.
@@ -568,7 +796,74 @@ export class Authenticator {
     options?: HandleSignOutOptions
   ) {
     // TODO: Implement sign out functionality
-    return;
+    this._logger.debug({
+      msg: 'Handling sign out logic from Lambda@Edge event',
+      event,
+    });
+
+    const { request } = event.Records[0].cf;
+    const requestParams = parse(request.querystring);
+    this._logger.debug({ msg: 'request params', requestParams });
+    const cfDomain = request.headers.host[0].value;
+    let redirectURI = `https://${cfDomain}`;
+
+    if (options?.signOutRedirectPath) {
+      redirectURI += options.signOutRedirectPath;
+    }
+
+    try {
+      const refreshToken = this._getRefreshTokenFromCookie(
+        request.headers.cookie
+      );
+      this._logger.debug({
+        msg: 'Revoking tokens using refresh token...',
+        refreshToken,
+      });
+      return this._revokeTokensUsingRefreshToken(refreshToken).then(() => {
+        return this._cleanUpCookieUsingCookie(
+          cfDomain,
+          redirectURI,
+          request.headers.cookie
+        );
+      });
+    } catch (err) {
+      this._logger.debug('Signout failed: %s', err);
+      if (requestParams.code) {
+        return this._fetchTokensFromCode(redirectURI, requestParams.code).then(
+          (tokens) =>
+            this._cleanUpCookieUsingToken(tokens, cfDomain, requestParams.state)
+        );
+      } else {
+        const userPoolUrl = `https://${this._userPoolDomain}?error=unauthorized_client`;
+        this._logger.debug(
+          'Throw 401 - if the user never authenticated or refresh_token is revoked or expired'
+        );
+        return {
+          status: '401',
+          statusDescription: 'Unauthorized',
+          headers: {
+            location: [
+              {
+                key: 'Location',
+                value: userPoolUrl,
+              },
+            ],
+            'cache-control': [
+              {
+                key: 'Cache-Control',
+                value: 'no-cache, no-store, max-age=0, must-revalidate',
+              },
+            ],
+            pragma: [
+              {
+                key: 'Pragma',
+                value: 'no-cache',
+              },
+            ],
+          },
+        };
+      }
+    }
   }
 
   /**
