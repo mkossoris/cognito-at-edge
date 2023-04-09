@@ -2,13 +2,18 @@ import axios from 'axios';
 import { parse, stringify } from 'querystring';
 import pino from 'pino';
 import { CognitoJwtVerifier } from 'aws-jwt-verify';
-import { CloudFrontRequestEvent, CloudFrontRequestResult } from 'aws-lambda';
+import {
+  CloudFrontRequest,
+  CloudFrontRequestEvent,
+  CloudFrontRequestResult,
+} from 'aws-lambda';
 import {
   CookieAttributes,
   Cookies,
   SameSite,
   SAME_SITE_VALUES,
 } from './util/cookie';
+import { generateNonce } from './util/crypto';
 
 interface AuthenticatorParams {
   region: string;
@@ -125,6 +130,27 @@ export class Authenticator {
     }
   }
 
+  private _validateNonce(request: CloudFrontRequest) {
+    const state = parse(request.querystring).state;
+    console.log('state is: ', state);
+
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { nonce: currentNonce, requestedUri } = JSON.parse(
+      Buffer.from(state as string, 'base64').toString()
+    );
+    console.log('currentNonce is: ', currentNonce);
+    const originalNonce = this._getNonceFromCookie(request.headers.cookie);
+    console.log('originalNonce is: ', originalNonce);
+    if (!currentNonce || !originalNonce || currentNonce !== originalNonce) {
+      if (!originalNonce) {
+        throw new Error(
+          "Your browser didn't send the nonce cookie along, but it is required for security to prevent CSRF."
+        );
+      }
+      throw new Error('Nonce mismatch');
+    }
+  }
+
   /**
    * Exchange authorization code for tokens.
    * @param  {String} redirectURI Redirection URI.
@@ -215,6 +241,7 @@ export class Authenticator {
       msg: 'Fetching new tokens using refresh token...',
       request,
     });
+    //TODO: Consider adding logic when connecting with cognito apis using axios.
     return axios
       .request(request)
       .then((resp) => {
@@ -277,77 +304,73 @@ export class Authenticator {
   }
 
   /**
-   * Signs the user out and redirects to an authorized sign-out URL for app client.
-   * @param  {String} logoutUrl       logoutUrl
-   * @return {Promise} void
-   */
-  private _logoutFromUserPool(logoutUrl: string) {
-    const getUrl = `${this._userPoolLogOutEndpoint}?client_id=${this._userPoolAppId}&logout_uri=${logoutUrl}`;
-    this._logger.debug({
-      msg: 'Signing out current session...',
-      getUrl,
-    });
-    return axios
-      .get(getUrl)
-      .then(() => {
-        this._logger.debug({ msg: 'Successfully signed out current session' });
-      })
-      .catch((err) => {
-        this._logger.error({
-          msg: 'Unable to sign out',
-          getUrl,
-        });
-        throw err;
-      });
-  }
-
-  /**
    * Create a Lambda@Edge redirection response to set the tokens on the user's browser cookies.
    * @param  {Object} tokens   Cognito User Pool tokens.
    * @param  {String} domain   Website domain.
    * @param  {String} location Path to redirection.
    * @return {Object} Lambda@Edge response.
    */
-  private async _getRedirectResponse(tokens, domain, location) {
+  private async _getRedirectResponse(
+    tokens,
+    domain,
+    location,
+    nonce = undefined
+  ) {
     const decoded = await this._jwtVerifier.verify(tokens.id_token);
     const username = decoded['cognito:username'];
     const usernameBase = `${this._cookieBase}.${username}`;
-    const cookieAttributes: CookieAttributes = {
+    const cookieAttributesGeneral: CookieAttributes = {
       domain: this._disableCookieDomain ? undefined : domain,
       expires: new Date(Date.now() + this._cookieExpirationDays * 864e5),
       secure: true,
       httpOnly: this._httpOnly,
       sameSite: this._sameSite,
     };
+
+    const nonceCookieAttributes: CookieAttributes = {
+      domain: this._disableCookieDomain ? undefined : domain,
+      maxAge: 1800,
+      secure: true,
+      httpOnly: true,
+      sameSite: this._sameSite,
+    };
+
     const cookies = [
       Cookies.serialize(
         `${usernameBase}.accessToken`,
         tokens.access_token,
-        cookieAttributes
+        cookieAttributesGeneral
       ),
       Cookies.serialize(
         `${usernameBase}.idToken`,
         tokens.id_token,
-        cookieAttributes
+        cookieAttributesGeneral
       ),
       Cookies.serialize(
         `${usernameBase}.refreshToken`,
         tokens.refresh_token,
-        cookieAttributes
+        cookieAttributesGeneral
       ),
       Cookies.serialize(
         `${usernameBase}.tokenScopesString`,
         'phone email profile openid aws.cognito.signin.user.admin',
-        cookieAttributes
+        cookieAttributesGeneral
       ),
       Cookies.serialize(
         `${this._cookieBase}.LastAuthUser`,
         username,
-        cookieAttributes
+        cookieAttributesGeneral
       ),
     ];
 
+    if (nonce) {
+      cookies.push(
+        Cookies.serialize('cognito-at-edge-nonce', nonce, nonceCookieAttributes)
+      );
+    }
+
     const response = {
+      // TODO: Consider replacing status code of all redirect responses with 307. Currently 302 for all.
       status: '302',
       headers: {
         location: [
@@ -384,6 +407,7 @@ export class Authenticator {
    * @param  {String} redirectURI Path to redirection.
    * @return {Object} Lambda@Edge response.
    */
+  //TODO: Clean up cookies by setting already expired date and replace value with empty field. Maybe only expired date is enough?
   private async _cleanUpCookieUsingToken(tokens, domain, redirectURI) {
     const decoded = await this._jwtVerifier.verify(tokens.id_token);
     const username = decoded['cognito:username'];
@@ -409,6 +433,7 @@ export class Authenticator {
         '',
         cookieAttributes
       ),
+      Cookies.serialize('cognito-at-edge-nonce', '', cookieAttributes),
     ];
 
     const response = {
@@ -495,6 +520,7 @@ export class Authenticator {
         '',
         cookieAttributes
       ),
+      Cookies.serialize('cognito-at-edge-nonce', '', cookieAttributes),
     ];
 
     const response = {
@@ -605,6 +631,38 @@ export class Authenticator {
     return token;
   }
 
+  /**
+   * Extract value of the nonce from the request cookies.
+   * @param  {Array}  cookieHeaders 'Cookie' request headers.
+   * @return {String} Extracted nonce token. Throw if not found.
+   */
+  private _getNonceFromCookie(
+    cookieHeaders:
+      | Array<{ key?: string | undefined; value: string }>
+      | undefined
+  ) {
+    if (!cookieHeaders) {
+      this._logger.debug("Cookies weren't present in the request");
+      throw new Error("Cookies weren't present in the request");
+    }
+
+    this._logger.debug({
+      msg: 'Extracting authentication token from request cookie',
+      cookieHeaders,
+    });
+    const nonce = cookieHeaders
+      .flatMap((h) => Cookies.parse(h.value))
+      .find((c) => c.name === 'cognito-at-edge-nonce').value;
+
+    if (!nonce) {
+      this._logger.debug("nonce wasn't present in request cookies");
+      throw new Error("nonce isn't present in the request cookies");
+    }
+
+    this._logger.debug({ msg: 'Found nonce in cookie', nonce });
+    return nonce;
+  }
+
   private _validateHandleCheckAuthOptions(options?: HandleCheckAuthOptions) {
     if (!options) {
       return;
@@ -647,12 +705,14 @@ export class Authenticator {
     event: CloudFrontRequestEvent,
     options?: HandleCheckAuthOptions
   ) {
-    // TODO: Protect from CSRF
     this._validateHandleCheckAuthOptions(options);
     this._logger.debug({ msg: 'Handling Lambda@Edge event', event });
 
-    const { request } = event.Records[0].cf;
+    const request = event.Records[0].cf.request;
     const requestParams = parse(request.querystring);
+    const requestedUri = `${request.uri}${
+      request.querystring ? '?' + request.querystring : ''
+    }`;
     const cfDomain = request.headers.host[0].value;
     let redirectURI = `https://${cfDomain}`;
 
@@ -661,6 +721,7 @@ export class Authenticator {
     }
 
     try {
+      this._validateNonce(request);
       const token = this._getIdTokenFromCookie(request.headers.cookie);
       this._logger.debug({ msg: 'Verifying token...', token });
       const user = await this._jwtVerifier.verify(token);
@@ -668,17 +729,42 @@ export class Authenticator {
       return request;
     } catch (err) {
       this._logger.debug("User isn't authenticated: %s", err);
+      const nonce = generateNonce();
+      const nonceCookieAttributes: CookieAttributes = {
+        domain: this._disableCookieDomain ? undefined : cfDomain,
+        maxAge: 1800,
+        secure: true,
+        httpOnly: true,
+        sameSite: this._sameSite,
+      };
+      const nonceCookieValue = Cookies.serialize(
+        'cognito-at-edge-nonce',
+        nonce,
+        nonceCookieAttributes
+      );
+      const state = Buffer.from(
+        JSON.stringify({ nonce, requestedUri })
+      ).toString('base64');
+
       if (requestParams.code) {
         return this._fetchTokensFromCode(redirectURI, requestParams.code).then(
-          (tokens) =>
-            this._getRedirectResponse(tokens, cfDomain, requestParams.state)
+          (tokens) => {
+            if (request.querystring && request.querystring !== '') {
+              redirectURI += '?' + `state=${state}`;
+            }
+
+            return this._getRedirectResponse(
+              tokens,
+              cfDomain,
+              redirectURI,
+              nonce
+            );
+          }
         );
       } else {
-        let redirectPath = request.uri;
-        if (request.querystring && request.querystring !== '') {
-          redirectPath += encodeURIComponent('?' + request.querystring);
-        }
-        const userPoolUrl = `https://${this._userPoolDomain}/login?redirect_uri=${redirectURI}&response_type=code&client_id=${this._userPoolAppId}&state=${redirectPath}`;
+        // /login and /oauth2/authorize are the same if not specifying an identity_provider or idp_identifier parameter in the URL
+        // TODO: Consider replacing with stringifyQueryString for all url used in location
+        const userPoolUrl = `https://${this._userPoolDomain}/login?redirect_uri=${redirectURI}&response_type=code&client_id=${this._userPoolAppId}&state=${state}`;
         this._logger.debug(
           `Redirecting user to Cognito User Pool URL ${userPoolUrl}`
         );
@@ -703,6 +789,7 @@ export class Authenticator {
                 value: 'no-cache',
               },
             ],
+            'set-cookie': [{ key: 'set-cookie', value: nonceCookieValue }],
           },
         };
       }
@@ -725,7 +812,7 @@ export class Authenticator {
       event,
     });
 
-    const { request } = event.Records[0].cf;
+    const request = event.Records[0].cf.request;
     const requestParams = parse(request.querystring);
     this._logger.debug({ msg: 'request params', requestParams });
     const cfDomain = request.headers.host[0].value;
@@ -735,7 +822,12 @@ export class Authenticator {
       redirectURI += options.refreshRedirectPath;
     }
 
+    const requestedUri = `${request.uri}${
+      request.querystring ? '?' + request.querystring : ''
+    }`;
+
     try {
+      this._validateNonce(request);
       const refreshToken = this._getRefreshTokenFromCookie(
         request.headers.cookie
       );
@@ -750,7 +842,17 @@ export class Authenticator {
         redirectURI
       );
       newTokens.refresh_token = refreshToken;
-      return this._getRedirectResponse(newTokens, cfDomain, redirectURI);
+
+      // prevent csrf, generate nonce
+      const nonce = generateNonce();
+      const state = Buffer.from(
+        JSON.stringify({ nonce, requestedUri })
+      ).toString('base64');
+      if (state && state !== '') {
+        redirectURI += '?' + `state=${state}`;
+      }
+
+      return this._getRedirectResponse(newTokens, cfDomain, redirectURI, nonce);
     } catch (err) {
       this._logger.debug("User isn't authenticated: %s", err);
       const userPoolUrl = `https://${this._userPoolDomain}?error=unauthorized_client`;
@@ -758,8 +860,8 @@ export class Authenticator {
         'Throw 401 - if the user never authenticated or refresh_token is revoked or expired'
       );
       return {
-        status: '401',
-        statusDescription: 'Unauthorized',
+        status: '400',
+        statusDescription: 'Bad Request',
         headers: {
           location: [
             {
@@ -795,7 +897,6 @@ export class Authenticator {
     event: CloudFrontRequestEvent,
     options?: HandleSignOutOptions
   ) {
-    // TODO: Implement sign out functionality
     this._logger.debug({
       msg: 'Handling sign out logic from Lambda@Edge event',
       event,
@@ -831,7 +932,7 @@ export class Authenticator {
       if (requestParams.code) {
         return this._fetchTokensFromCode(redirectURI, requestParams.code).then(
           (tokens) =>
-            this._cleanUpCookieUsingToken(tokens, cfDomain, requestParams.state)
+            this._cleanUpCookieUsingToken(tokens, cfDomain, redirectURI)
         );
       } else {
         const userPoolUrl = `https://${this._userPoolDomain}?error=unauthorized_client`;
