@@ -14,6 +14,7 @@ import {
   SAME_SITE_VALUES,
 } from './util/cookie';
 import { generateNonce } from './util/crypto';
+import * as common from './util/common';
 
 interface AuthenticatorParams {
   region: string;
@@ -35,10 +36,12 @@ interface HandleCheckAuthOptions {
    * @default /
    */
   signInRedirectPath?: string;
+  requestedRedirectUri?: string;
 }
 
 interface HandleRefreshAuthOptions {
   refreshRedirectPath?: string;
+  requestedRedirectUri?: string;
 }
 
 interface HandleSignOutOptions {
@@ -48,6 +51,7 @@ interface HandleSignOutOptions {
    * @default /
    */
   signOutRedirectPath?: string;
+  requestedRedirectUri?: string;
 }
 
 export class Authenticator {
@@ -94,6 +98,14 @@ export class Authenticator {
     });
   }
 
+  parseCookie(cookieHeaders) {
+    return Cookies.parse(cookieHeaders);
+  }
+
+  serializeCookie(name: string, value: string, attributes: CookieAttributes) {
+    return Cookies.serialize(name, value, attributes);
+  }
+
   /**
    * Verify that constructor parameters are corrects.
    * @param  {object} params constructor params
@@ -136,7 +148,7 @@ export class Authenticator {
 
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { nonce: currentNonce, requestedUri } = JSON.parse(
-      Buffer.from(state as string, 'base64').toString()
+      Buffer.from(common.urlSafe.parse(state as string), 'base64').toString()
     );
     console.log('currentNonce is: ', currentNonce);
     const originalNonce = this._getNonceFromCookie(request.headers.cookie);
@@ -310,12 +322,7 @@ export class Authenticator {
    * @param  {String} location Path to redirection.
    * @return {Object} Lambda@Edge response.
    */
-  private async _getRedirectResponse(
-    tokens,
-    domain,
-    location,
-    nonce = undefined
-  ) {
+  async getRedirectResponse(tokens, domain, location, nonce = undefined) {
     const decoded = await this._jwtVerifier.verify(tokens.id_token);
     const username = decoded['cognito:username'];
     const usernameBase = `${this._cookieBase}.${username}`;
@@ -408,7 +415,13 @@ export class Authenticator {
    * @return {Object} Lambda@Edge response.
    */
   //TODO: Clean up cookies by setting already expired date and replace value with empty field. Maybe only expired date is enough?
-  private async _cleanUpCookieUsingToken(tokens, domain, redirectURI) {
+  private async _cleanUpCookieUsingToken(
+    tokens,
+    domain,
+    redirectURI,
+    state,
+    nonce
+  ) {
     const decoded = await this._jwtVerifier.verify(tokens.id_token);
     const username = decoded['cognito:username'];
     const usernameBase = `${this._cookieBase}.${username}`;
@@ -433,7 +446,7 @@ export class Authenticator {
         '',
         cookieAttributes
       ),
-      Cookies.serialize('cognito-at-edge-nonce', '', cookieAttributes),
+      Cookies.serialize('cognito-at-edge-nonce', nonce, cookieAttributes),
     ];
 
     const response = {
@@ -442,7 +455,8 @@ export class Authenticator {
         location: [
           {
             key: 'Location',
-            value: `${this._userPoolLogOutEndpoint}?client_id=${this._userPoolAppId}&logout_uri=${redirectURI}`,
+            // value: `${this._userPoolLogOutEndpoint}?client_id=${this._userPoolAppId}&response_type=code&redirect_uri=${redirectURI}&state=${state}`,
+            value: `${this._userPoolLogOutEndpoint}?client_id=${this._userPoolAppId}&logout_uri=${redirectURI}&state=${state}`,
           },
         ],
         'cache-control': [
@@ -476,7 +490,9 @@ export class Authenticator {
     redirectURI,
     cookieHeaders:
       | Array<{ key?: string | undefined; value: string }>
-      | undefined
+      | undefined,
+    state,
+    nonce
   ) {
     if (!cookieHeaders) {
       this._logger.debug("Cookies weren't present in the request");
@@ -520,7 +536,7 @@ export class Authenticator {
         '',
         cookieAttributes
       ),
-      Cookies.serialize('cognito-at-edge-nonce', '', cookieAttributes),
+      Cookies.serialize('cognito-at-edge-nonce', nonce, cookieAttributes),
     ];
 
     const response = {
@@ -529,7 +545,8 @@ export class Authenticator {
         location: [
           {
             key: 'Location',
-            value: `${this._userPoolLogOutEndpoint}?client_id=${this._userPoolAppId}&logout_uri=${redirectURI}`,
+            // value: `${this._userPoolLogOutEndpoint}?client_id=${this._userPoolAppId}&response_type=code&redirect_uri=${redirectURI}&state=${state}`,
+            value: `${this._userPoolLogOutEndpoint}?client_id=${this._userPoolAppId}&logout_uri=${redirectURI}&state=${state}`,
           },
         ],
         'cache-control': [
@@ -632,6 +649,81 @@ export class Authenticator {
   }
 
   /**
+   * Extract value of the authentication token from the request cookies.
+   * @param  {Array}  cookieHeaders 'Cookie' request headers.
+   * @return {String} Extracted id token. Throw if not found.
+   */
+  private _getTokensFromCookie(
+    cookieHeaders:
+      | Array<{ key?: string | undefined; value: string }>
+      | undefined
+  ) {
+    if (!cookieHeaders) {
+      this._logger.debug("Cookies weren't present in the request");
+      throw new Error("Cookies weren't present in the request");
+    }
+
+    this._logger.debug({
+      msg: 'Extracting authentication token from request cookie',
+      cookieHeaders,
+    });
+
+    const idTokenCookieNamePrefix = `${this._cookieBase}.`;
+    const idTokenCookieNamePostfix = '.idToken';
+
+    const cookies = cookieHeaders.flatMap((h) => Cookies.parse(h.value));
+    const idToken = cookies.find(
+      (c) =>
+        c.name.startsWith(idTokenCookieNamePrefix) &&
+        c.name.endsWith(idTokenCookieNamePostfix)
+    )?.value;
+
+    if (!idToken) {
+      this._logger.debug("idToken wasn't present in request cookies");
+      throw new Error("idToken isn't present in the request cookies");
+    }
+
+    this._logger.debug({ msg: 'Found idToken in cookie', idToken });
+
+    const accessTokenCookieNamePrefix = `${this._cookieBase}.`;
+    const accessTokenCookieNamePostfix = '.accessToken';
+    const accessToken = cookies.find(
+      (c) =>
+        c.name.startsWith(accessTokenCookieNamePrefix) &&
+        c.name.endsWith(accessTokenCookieNamePostfix)
+    )?.value;
+
+    if (!accessToken) {
+      this._logger.debug("accessToken wasn't present in request cookies");
+      throw new Error("accessToken isn't present in the request cookies");
+    }
+
+    this._logger.debug({ msg: 'Found accessToken in cookie', accessToken });
+
+    const refreshTokenCookieNamePrefix = `${this._cookieBase}.`;
+    const refreshTokenCookieNamePostfix = '.refreshToken';
+
+    const refreshToken = cookies.find(
+      (c) =>
+        c.name.startsWith(refreshTokenCookieNamePrefix) &&
+        c.name.endsWith(refreshTokenCookieNamePostfix)
+    )?.value;
+
+    if (!idToken) {
+      this._logger.debug("refreshToken wasn't present in request cookies");
+      throw new Error("refreshToken isn't present in the request cookies");
+    }
+
+    this._logger.debug({ msg: 'Found refreshToken in cookie', refreshToken });
+
+    return {
+      id_token: idToken,
+      access_token: accessToken,
+      refresh_token: refreshToken,
+    };
+  }
+
+  /**
    * Extract value of the nonce from the request cookies.
    * @param  {Array}  cookieHeaders 'Cookie' request headers.
    * @return {String} Extracted nonce token. Throw if not found.
@@ -676,6 +768,38 @@ export class Authenticator {
         'HandleCheckAuthOptions.signInRedirectPath must start with a "/"'
       );
     }
+    if (
+      options.requestedRedirectUri &&
+      !options.requestedRedirectUri.startsWith('https://')
+    ) {
+      throw new Error(
+        'HandleCheckAuthOptions.requestedRedirectUri must start with a "https://"'
+      );
+    }
+  }
+
+  private _validateHandleRefreshOptions(options?: HandleRefreshAuthOptions) {
+    if (!options) {
+      return;
+    }
+
+    if (
+      options.refreshRedirectPath &&
+      !options.refreshRedirectPath.startsWith('/')
+    ) {
+      throw new Error(
+        'HandleRefreshAuthOptions.signOutRedirectPath must start with a "/"'
+      );
+    }
+
+    if (
+      options.requestedRedirectUri &&
+      !options.requestedRedirectUri.startsWith('https://')
+    ) {
+      throw new Error(
+        'HandleRefreshAuthOptions.requestedRedirectUri must start with a "https://"'
+      );
+    }
   }
 
   private _validateHandleSignOutOptions(options?: HandleSignOutOptions) {
@@ -689,6 +813,15 @@ export class Authenticator {
     ) {
       throw new Error(
         'HandleSignOutOptions.signOutRedirectPath must start with a "/"'
+      );
+    }
+
+    if (
+      options.requestedRedirectUri &&
+      !options.requestedRedirectUri.startsWith('https://')
+    ) {
+      throw new Error(
+        'HandleSignOutOptions.requestedRedirectUri must start with a "https://"'
       );
     }
   }
@@ -726,7 +859,35 @@ export class Authenticator {
       this._logger.debug({ msg: 'Verifying token...', token });
       const user = await this._jwtVerifier.verify(token);
       this._logger.info({ msg: 'Forwarding request', path: request.uri, user });
-      return request;
+
+      if (options.requestedRedirectUri) {
+        console.log(
+          'Handle checkauth redirect when requestedRedirectUri is valid'
+        );
+        const nonce = generateNonce();
+        console.log(
+          'New nonce for check auth pass - forwarding request is: ',
+          nonce
+        );
+        const uriUsedInState = encodeURIComponent(
+          options?.requestedRedirectUri ?? requestedUri
+        );
+        console.log('uriUsedInState is: ', uriUsedInState);
+        const state = common.urlSafe.stringify(
+          Buffer.from(JSON.stringify({ nonce, uriUsedInState })).toString(
+            'base64'
+          )
+        );
+        console.log('state is: ', state);
+
+        request.headers.cookie.flatMap((h) => Cookies.parse(h.value));
+        const tokens = this._getTokensFromCookie(request.headers.cookie);
+
+        redirectURI += '?' + `&state=${state}`;
+        return this.getRedirectResponse(tokens, cfDomain, redirectURI, nonce);
+      } else {
+        return request;
+      }
     } catch (err) {
       this._logger.debug("User isn't authenticated: %s", err);
       const nonce = generateNonce();
@@ -742,18 +903,24 @@ export class Authenticator {
         nonce,
         nonceCookieAttributes
       );
-      const state = Buffer.from(
-        JSON.stringify({ nonce, requestedUri })
-      ).toString('base64');
+
+      const uriUsedInState = encodeURIComponent(
+        options?.requestedRedirectUri ?? requestedUri
+      );
+      console.log('uriUsedInState is: ', uriUsedInState);
+      const state = common.urlSafe.stringify(
+        Buffer.from(JSON.stringify({ nonce, uriUsedInState })).toString(
+          'base64'
+        )
+      );
+      console.log('state is: ', state);
 
       if (requestParams.code) {
         return this._fetchTokensFromCode(redirectURI, requestParams.code).then(
           (tokens) => {
-            if (request.querystring && request.querystring !== '') {
-              redirectURI += '?' + `state=${state}`;
-            }
+            redirectURI += '?' + `&state=${state}`;
 
-            return this._getRedirectResponse(
+            return this.getRedirectResponse(
               tokens,
               cfDomain,
               redirectURI,
@@ -812,6 +979,8 @@ export class Authenticator {
       event,
     });
 
+    this._validateHandleRefreshOptions(options);
+
     const request = event.Records[0].cf.request;
     const requestParams = parse(request.querystring);
     this._logger.debug({ msg: 'request params', requestParams });
@@ -845,14 +1014,22 @@ export class Authenticator {
 
       // prevent csrf, generate nonce
       const nonce = generateNonce();
-      const state = Buffer.from(
-        JSON.stringify({ nonce, requestedUri })
-      ).toString('base64');
+      const uriUsedInState = encodeURIComponent(
+        options?.requestedRedirectUri ?? requestedUri
+      );
+      console.log('uriUsedInState is: ', uriUsedInState);
+      const state = common.urlSafe.stringify(
+        Buffer.from(JSON.stringify({ nonce, uriUsedInState })).toString(
+          'base64'
+        )
+      );
+      console.log('state is: ', state);
+
       if (state && state !== '') {
         redirectURI += '?' + `state=${state}`;
       }
-
-      return this._getRedirectResponse(newTokens, cfDomain, redirectURI, nonce);
+      return this.getRedirectResponse(newTokens, cfDomain, redirectURI, nonce);
+      // return this.getRedirectResponse(newTokens, cfDomain, redirectURI, nonce);
     } catch (err) {
       this._logger.debug("User isn't authenticated: %s", err);
       const userPoolUrl = `https://${this._userPoolDomain}?error=unauthorized_client`;
@@ -902,6 +1079,8 @@ export class Authenticator {
       event,
     });
 
+    this._validateHandleSignOutOptions(options);
+
     const { request } = event.Records[0].cf;
     const requestParams = parse(request.querystring);
     this._logger.debug({ msg: 'request params', requestParams });
@@ -912,7 +1091,20 @@ export class Authenticator {
       redirectURI += options.signOutRedirectPath;
     }
 
+    const uriUsedInState = encodeURIComponent(
+      options?.requestedRedirectUri ?? redirectURI
+    );
+    console.log('uriUsedInState is: ', uriUsedInState);
+
+    const nonce = generateNonce();
+    console.log('nonce is: ', nonce);
+    const state = common.urlSafe.stringify(
+      Buffer.from(JSON.stringify({ nonce, uriUsedInState })).toString('base64')
+    );
+    console.log('state is: ', state);
+
     try {
+      this._validateNonce(request);
       const refreshToken = this._getRefreshTokenFromCookie(
         request.headers.cookie
       );
@@ -923,8 +1115,10 @@ export class Authenticator {
       return this._revokeTokensUsingRefreshToken(refreshToken).then(() => {
         return this._cleanUpCookieUsingCookie(
           cfDomain,
-          redirectURI,
-          request.headers.cookie
+          options?.requestedRedirectUri ?? redirectURI,
+          request.headers.cookie,
+          state,
+          nonce
         );
       });
     } catch (err) {
@@ -932,7 +1126,14 @@ export class Authenticator {
       if (requestParams.code) {
         return this._fetchTokensFromCode(redirectURI, requestParams.code).then(
           (tokens) =>
-            this._cleanUpCookieUsingToken(tokens, cfDomain, redirectURI)
+            // this._cleanUpCookieUsingToken(tokens, cfDomain, redirectURI)
+            this._cleanUpCookieUsingToken(
+              tokens,
+              cfDomain,
+              options?.requestedRedirectUri ?? redirectURI,
+              state,
+              nonce
+            )
         );
       } else {
         const userPoolUrl = `https://${this._userPoolDomain}?error=unauthorized_client`;
